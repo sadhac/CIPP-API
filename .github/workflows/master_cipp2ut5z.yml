@@ -25,6 +25,5 @@ jobs:
         id: fa
         with:
           app-name: 'cipp2ut5z'
-          slot-name: 'Production'
           package: ${{ env.AZURE_FUNCTIONAPP_PACKAGE_PATH }}
           publish-profile: ${{ secrets.AZUREAPPSERVICE_PUBLISHPROFILE_01920EA1C5024A7196D90E11CD5D82F5 }}
