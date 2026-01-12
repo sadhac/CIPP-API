@@ -8,26 +8,23 @@ function Invoke-CIPPStandardSecureScoreRemediation {
         (Label) Update Secure Score Control Profiles
     .DESCRIPTION
         (Helptext) Allows bulk updating of Secure Score control profiles across tenants. Select controls and assign them to different states: Default, Ignored, Third-Party, or Reviewed.
-        (DocsDescription) Enables automated or template-based updates to Microsoft Secure Score recommendations. This is particularly useful for MSPs managing multiple tenants, allowing you to mark controls as "Third-party" (e.g., when using Mimecast, IronScales, or other third-party security tools) or set them to other states in bulk. This ensures Secure Scores accurately reflect each tenant's true security posture without repetitive manual updates.
+        (DocsDescription) Allows bulk updating of Secure Score control profiles across tenants. Select controls and assign them to different states: Default, Ignored, Third-Party, or Reviewed.
     .NOTES
         CAT
             Global Standards
         TAG
             "lowimpact"
-        EXECUTIVETEXT
-            Automates the management of Secure Score control profiles by allowing bulk updates across tenants. This ensures accurate representation of security posture when using third-party security tools or when certain controls need to be marked as resolved or ignored, significantly reducing manual administrative overhead for MSPs managing multiple clients.
         ADDEDCOMPONENT
-            {"type":"autoComplete","multiple":true,"creatable":true,"name":"standards.SecureScoreRemediation.Default","label":"Controls to set to Default"}
-            {"type":"autoComplete","multiple":true,"creatable":true,"name":"standards.SecureScoreRemediation.Ignored","label":"Controls to set to Ignored"}
-            {"type":"autoComplete","multiple":true,"creatable":true,"name":"standards.SecureScoreRemediation.ThirdParty","label":"Controls to set to Third-Party"}
-            {"type":"autoComplete","multiple":true,"creatable":true,"name":"standards.SecureScoreRemediation.Reviewed","label":"Controls to set to Reviewed"}
+            {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SecureScoreRemediation.Default","label":"Controls to set to Default","api":{"url":"/secureScore.json","labelField":"title","valueField":"id"}}
+            {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SecureScoreRemediation.Ignored","label":"Controls to set to Ignored","api":{"url":"/secureScore.json","labelField":"title","valueField":"id"}}
+            {"type":"autoComplete","multiple":true,"creatable":true,"required":false,"name":"standards.SecureScoreRemediation.ThirdParty","label":"Controls to set to Third-Party","api":{"url":"/secureScore.json","labelField":"title","valueField":"id"}}
+            {"type":"autoComplete","multiple":true,"required":false,"creatable":true,"name":"standards.SecureScoreRemediation.Reviewed","label":"Controls to set to Reviewed","api":{"url":"/secureScore.json","labelField":"title","valueField":"id"}}
         IMPACT
             Low Impact
         ADDEDDATE
             2025-11-19
         POWERSHELLEQUIVALENT
             New-GraphPostRequest to /beta/security/secureScoreControlProfiles/{id}
-        RECOMMENDEDBY
         UPDATECOMMENTBLOCK
             Run the Tools\Update-StandardsComments.ps1 script to update this comment block
     .LINK
@@ -36,7 +33,7 @@ function Invoke-CIPPStandardSecureScoreRemediation {
 
     param($Tenant, $Settings)
 
-    
+
     # Get current secure score controls
     try {
         $CurrentControls = New-GraphGetRequest -uri 'https://graph.microsoft.com/beta/security/secureScoreControlProfiles' -tenantid $Tenant
@@ -48,58 +45,58 @@ function Invoke-CIPPStandardSecureScoreRemediation {
 
     # Build list of controls with their desired states
     $ControlsToUpdate = [System.Collections.Generic.List[object]]::new()
-    
+
     # Process Default controls
     $DefaultControls = $Settings.Default.value ?? $Settings.Default
     if ($DefaultControls) {
         foreach ($ControlName in $DefaultControls) {
             $ControlsToUpdate.Add(@{
-                ControlName = $ControlName
-                State = 'default'
-                Reason = 'Default'
-            })
+                    ControlName = $ControlName
+                    State       = 'default'
+                    Reason      = 'Default'
+                })
         }
     }
-    
+
     # Process Ignored controls
     $IgnoredControls = $Settings.Ignored.value ?? $Settings.Ignored
     if ($IgnoredControls) {
         foreach ($ControlName in $IgnoredControls) {
             $ControlsToUpdate.Add(@{
-                ControlName = $ControlName
-                State = 'ignored'
-                Reason = 'Ignored'
-            })
+                    ControlName = $ControlName
+                    State       = 'ignored'
+                    Reason      = 'Ignored'
+                })
         }
     }
-    
+
     # Process ThirdParty controls
     $ThirdPartyControls = $Settings.ThirdParty.value ?? $Settings.ThirdParty
     if ($ThirdPartyControls) {
         foreach ($ControlName in $ThirdPartyControls) {
             $ControlsToUpdate.Add(@{
-                ControlName = $ControlName
-                State = 'thirdParty'
-                Reason = 'ThirdParty'
-            })
+                    ControlName = $ControlName
+                    State       = 'thirdParty'
+                    Reason      = 'ThirdParty'
+                })
         }
     }
-    
+
     # Process Reviewed controls
     $ReviewedControls = $Settings.Reviewed.value ?? $Settings.Reviewed
     if ($ReviewedControls) {
         foreach ($ControlName in $ReviewedControls) {
             $ControlsToUpdate.Add(@{
-                ControlName = $ControlName
-                State = 'reviewed'
-                Reason = 'Reviewed'
-            })
+                    ControlName = $ControlName
+                    State       = 'reviewed'
+                    Reason      = 'Reviewed'
+                })
         }
     }
 
     if ($Settings.remediate -eq $true) {
         Write-Host 'Processing Secure Score control updates'
-        
+
         foreach ($Control in $ControlsToUpdate) {
             # Skip if this is a Defender control (starts with scid_)
             if ($Control.ControlName -match '^scid_') {
@@ -109,8 +106,12 @@ function Invoke-CIPPStandardSecureScoreRemediation {
 
             # Build the request body
             $Body = @{
-                state = $Control.State
-                comment = $Control.Reason
+                state             = $Control.State
+                comment           = $Control.Reason
+                vendorInformation = @{
+                    vendor   = 'Microsoft'
+                    provider = 'SecureScore'
+                }
             }
 
             try {
@@ -133,14 +134,14 @@ function Invoke-CIPPStandardSecureScoreRemediation {
 
     if ($Settings.alert -eq $true) {
         $AlertMessages = [System.Collections.Generic.List[string]]::new()
-        
+
         foreach ($Control in $ControlsToUpdate) {
             if ($Control.ControlName -match '^scid_') {
                 continue
             }
-            
+
             $CurrentControl = $CurrentControls | Where-Object { $_.id -eq $Control.ControlName }
-            
+
             if ($CurrentControl) {
                 if ($CurrentControl.state -eq $Control.State) {
                     Write-LogMessage -API 'Standards' -tenant $tenant -message "Control $($Control.ControlName) is in expected state: $($Control.State)" -sev Info
@@ -155,40 +156,36 @@ function Invoke-CIPPStandardSecureScoreRemediation {
                 Write-LogMessage -API 'Standards' -tenant $tenant -message $AlertMessage -sev Warning
             }
         }
-        
+
         if ($AlertMessages.Count -gt 0) {
-            Write-StandardsAlert -message "Secure Score controls not in expected state" -object @{Issues = $AlertMessages.ToArray()} -tenant $Tenant -standardName 'SecureScoreRemediation' -standardId $Settings.standardId
+            Write-StandardsAlert -message 'Secure Score controls not in expected state' -object @{Issues = $AlertMessages.ToArray() } -tenant $Tenant -standardName 'SecureScoreRemediation' -standardId $Settings.standardId
         }
     }
 
     if ($Settings.report -eq $true) {
         $ReportData = [System.Collections.Generic.List[object]]::new()
-        
+
         foreach ($Control in $ControlsToUpdate) {
             if ($Control.ControlName -match '^scid_') {
                 continue
             }
-            
+
             $CurrentControl = $CurrentControls | Where-Object { $_.id -eq $Control.ControlName }
-            
-            if ($CurrentControl) {
+            $LatestState = ($CurrentControl.controlStateUpdates | Select-Object -Last 1).state
+            if ($LatestState -ne $Control.State) {
                 $ReportData.Add(@{
-                    ControlName = $Control.ControlName
-                    CurrentState = $CurrentControl.state
-                    DesiredState = $Control.State
-                    InCompliance = ($CurrentControl.state -eq $Control.State)
-                })
-            } else {
-                $ReportData.Add(@{
-                    ControlName = $Control.ControlName
-                    CurrentState = 'Not Found'
-                    DesiredState = $Control.State
-                    InCompliance = $false
-                })
+                        ControlName  = $Control.ControlName
+                        CurrentState = $LatestState
+                        DesiredState = $Control.State
+                        InCompliance = $false
+                    })
             }
         }
-        
-        Set-CIPPStandardsCompareField -FieldName 'standards.SecureScoreRemediation' -FieldValue $ReportData.ToArray() -Tenant $tenant
-        Add-CIPPBPAField -FieldName 'SecureScoreRemediation' -FieldValue $ReportData.ToArray() -StoreAs json -Tenant $tenant
+        if ($ReportData.count -eq 0) {
+            $ReportData = $true
+        }
+
+        Set-CIPPStandardsCompareField -FieldName 'standards.SecureScoreRemediation' -FieldValue $ReportData -Tenant $tenant
+        Add-CIPPBPAField -FieldName 'SecureScoreRemediation' -FieldValue $ReportData -StoreAs json -Tenant $tenant
     }
 }

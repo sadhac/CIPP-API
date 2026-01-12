@@ -15,11 +15,11 @@ env:
 jobs:
   deploy:
     runs-on: windows-latest
-    
+
     steps:
       - name: 'Checkout GitHub Action'
         uses: actions/checkout@v4
-      
+
       - name: 'Run Azure Functions Action'
         uses: Azure/functions-action@v1
         id: fa
