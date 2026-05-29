@@ -1,0 +1,158 @@
+name: Weekly Upstream Sync
+
+on:
+  schedule:
+    # Runs every Sunday at 00:00 UTC
+    - cron: '0 0 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+jobs:
+  sync-upstream:
+    name: Sync upstream and check PR conflicts
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/KelvinTegelaar/CIPP-API.git
+          git fetch upstream master
+
+      - name: Merge upstream/master into main
+        id: merge
+        run: |
+          # Try clean merge first; if conflicts arise, prefer upstream (theirs)
+          if git merge upstream/master --no-edit; then
+            echo "merged=clean" >> "$GITHUB_OUTPUT"
+          else
+            echo "Conflicts detected — resolving by preferring upstream changes"
+            # Mark all conflicted files as resolved by taking upstream version
+            git diff --name-only --diff-filter=U | xargs -r git checkout --theirs --
+            git diff --name-only --diff-filter=U | xargs -r git add
+            git merge --continue --no-edit
+            echo "merged=with_conflicts" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push merged main
+        run: git push origin main
+
+      - name: Check open PRs for merge conflicts
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const { execSync } = require('child_process');
+
+            // Fetch all open PRs targeting main
+            const pulls = await github.paginate(github.rest.pulls.list, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              state: 'open',
+              base: 'main',
+              per_page: 100,
+            });
+
+            if (pulls.length === 0) {
+              console.log('No open PRs targeting main.');
+              return;
+            }
+
+            for (const pr of pulls) {
+              console.log(`Checking PR #${pr.number}: ${pr.title}`);
+
+              // Fetch the PR head branch
+              try {
+                execSync(
+                  `git fetch origin refs/pull/${pr.number}/head:refs/remotes/pr/${pr.number}`,
+                  { stdio: 'inherit' }
+                );
+              } catch (e) {
+                console.log(`Could not fetch PR #${pr.number} head, skipping.`);
+                continue;
+              }
+
+              // Attempt a dry-run merge to detect conflicts
+              let conflictedFiles = [];
+              try {
+                execSync(
+                  `git merge --no-commit --no-ff refs/remotes/pr/${pr.number}`,
+                  { stdio: 'pipe' }
+                );
+                // No conflicts
+                execSync('git merge --abort', { stdio: 'pipe' });
+              } catch (e) {
+                // Collect conflicted file list
+                try {
+                  const output = execSync(
+                    'git diff --name-only --diff-filter=U',
+                    { encoding: 'utf8' }
+                  ).trim();
+                  conflictedFiles = output ? output.split('\n') : [];
+                } catch (_) {}
+
+                // Abort the attempted merge
+                try { execSync('git merge --abort', { stdio: 'pipe' }); } catch (_) {}
+
+                // Check if we already posted a conflict warning for this PR
+                const comments = await github.paginate(
+                  github.rest.issues.listComments,
+                  {
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    per_page: 100,
+                  }
+                );
+
+                const botMarker = '<!-- upstream-sync-conflict-warning -->';
+                const alreadyCommented = comments.some(
+                  c => c.user.login === 'github-actions[bot]' && c.body.includes(botMarker)
+                );
+
+                if (!alreadyCommented) {
+                  const fileList = conflictedFiles.length
+                    ? conflictedFiles.map(f => '- `' + f + '`').join('\n')
+                    : '_Unable to determine conflicted files._';
+
+                  const body = [
+                    botMarker,
+                    ':warning: **Merge conflict detected after upstream sync**',
+                    '',
+                    'This PR has merge conflicts with the updated `main` branch (synced from [KelvinTegelaar/CIPP-API](https://github.com/KelvinTegelaar/CIPP-API) upstream).',
+                    '',
+                    '**Conflicting files:**',
+                    fileList,
+                    '',
+                    'Please rebase or merge `main` into your branch and resolve the conflicts before this PR can be merged.',
+                  ].join('\n');
+
+                  await github.rest.issues.createComment({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    issue_number: pr.number,
+                    body,
+                  });
+                }
+              }
+
+              // Clean up temporary remote-tracking ref
+              try {
+                execSync(`git branch -D -r pr/${pr.number}`, { stdio: 'pipe' });
+              } catch (_) {}
+            }
