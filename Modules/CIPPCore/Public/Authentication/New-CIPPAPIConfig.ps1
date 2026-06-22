@@ -22,6 +22,20 @@ function New-CIPPAPIConfig {
         if ($AppId) {
             $APIApp = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appid='$($AppId)')" -NoAuthCheck $true -AsApp $true
             Write-Information "Found existing app with AppId $AppId"
+
+            # Validate and repair identifier URI for existing apps
+            try {
+                $RepairResult = Repair-CippApiIdentifierUri -AppId $AppId -ApplicationObjectId $APIApp.id
+                if ($RepairResult.Fixed) {
+                    Write-Information "Repaired identifier URI: $($RepairResult.Message)"
+                    Write-LogMessage -headers $Headers -API $APINAME -tenant 'None' -message "Repaired identifier URI for app $AppId $($RepairResult.Message)" -Sev 'Info'
+                } else {
+                    Write-Information "Identifier URI validation: $($RepairResult.Message)"
+                }
+            } catch {
+                Write-Warning "Failed to validate/repair identifier URI for existing app: $($_.Exception.Message)"
+                # Don't fail the whole operation if URI repair fails
+            }
         } else {
             $CreateBody = @{
                 api                    = @{
@@ -76,8 +90,8 @@ function New-CIPPAPIConfig {
 
                 Write-Information 'Creating password'
                 $Step = 'Creating Application Password'
-                $AppManagementPolicy = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/policies/defaultAppManagementPolicy" -AsApp $true -NoAuthCheck $true
-                $PasswordExpirationPolicy =  $AppManagementPolicy.applicationRestrictions.passwordcredentials |
+                $AppManagementPolicy = New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/policies/defaultAppManagementPolicy' -AsApp $true -NoAuthCheck $true
+                $PasswordExpirationPolicy = $AppManagementPolicy.applicationRestrictions.passwordcredentials |
                     Where-Object { $_.restrictionType -eq 'passwordLifetime' }
                 $PasswordBody = $null
                 if (-not ($PasswordExpirationPolicy.state -eq 'disabled' -or $null -eq $PasswordExpirationPolicy.state)) {
@@ -93,7 +107,9 @@ function New-CIPPAPIConfig {
                         $APIPassword = New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$($APIApp.id)/addPassword" -AsApp $true -NoAuthCheck $true -type POST -body $PasswordBody -maxRetries 3
                         break
                     } catch {
+                        $ExceptionMessage = $_.Exception.Message
                         $IsNotReplicatedYet = $_.Exception.Message -match "Resource '.*' does not exist or one of its queried reference-property objects are not present"
+                        $IsCredentialPolicyBlocked = $ExceptionMessage -match 'Credential type not allowed as per assigned policy'
                         if ($IsNotReplicatedYet -and $Attempt -lt 6) {
                             $DelaySeconds = 3
                             Write-Information "Application object not yet replicated for addPassword (attempt $Attempt of 6). Retrying in $DelaySeconds second(s)."
@@ -105,6 +121,14 @@ function New-CIPPAPIConfig {
                             }
                             continue
                         }
+
+                        if ($IsCredentialPolicyBlocked -and $Attempt -lt 6) {
+                            $DelaySeconds = [Math]::Min(30, 5 * $Attempt)
+                            Write-Information "Credential policy still blocks addPassword (attempt $Attempt of 6). Waiting for policy propagation and retrying in $DelaySeconds second(s)."
+                            Start-Sleep -Seconds $DelaySeconds
+                            continue
+                        }
+
                         throw
                     }
                 }
@@ -112,29 +136,58 @@ function New-CIPPAPIConfig {
                 if (-not $APIPassword) {
                     throw 'Failed to create application password after retries. The app may not have replicated yet; wait a moment and retry.'
                 }
-                Write-Information 'Adding App URL'
+
+                Write-Information 'Adding Application Identifier URI'
                 $Step = 'Adding Application Identifier URI'
-                $IdentifierUriBody = "{`"identifierUris`":[`"api://$($APIApp.appId)`"]}"
-                $IdentifierUriUpdated = $false
-                for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
-                    try {
-                        New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$($APIApp.id)" -AsApp $true -NoAuthCheck $true -type PATCH -body $IdentifierUriBody -maxRetries 3 | Out-Null
-                        $IdentifierUriUpdated = $true
-                        break
-                    } catch {
-                        $IsNotReplicatedYet = $_.Exception.Message -match "Resource '.*' does not exist or one of its queried reference-property objects are not present"
-                        if ($IsNotReplicatedYet -and $Attempt -lt 6) {
-                            $DelaySeconds = 3
-                            Write-Information "Application object not yet replicated for identifier URI update (attempt $Attempt of 6). Retrying in $DelaySeconds second(s)."
-                            Start-Sleep -Seconds $DelaySeconds
-                            try {
-                                $APIApp = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appid='$($APIApp.appId)')" -NoAuthCheck $true -AsApp $true
-                            } catch {
-                                Write-Information "Application lookup retry failed before identifier URI retry: $($_.Exception.Message)"
+                $DesiredIdentifierUri = "api://$($APIApp.appId)"
+
+                # Check if identifier URI already exists
+                if ($APIApp.identifierUris -contains $DesiredIdentifierUri) {
+                    Write-Information "Application Identifier URI '$DesiredIdentifierUri' already set, skipping."
+                    $IdentifierUriUpdated = $true
+                } else {
+                    Write-Information "Setting Application Identifier URI to '$DesiredIdentifierUri'"
+                    $IdentifierUriBody = @{
+                        identifierUris = @($DesiredIdentifierUri)
+                    }
+                    $IdentifierUriUpdated = $false
+                    for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
+                        try {
+                            New-GraphPOSTRequest -uri "https://graph.microsoft.com/v1.0/applications/$($APIApp.id)" -AsApp $true -NoAuthCheck $true -type PATCH -body $IdentifierUriBody -maxRetries 3 | Out-Null
+                            Write-Information "Successfully set identifier URI on attempt $Attempt"
+                            $IdentifierUriUpdated = $true
+                            break
+                        } catch {
+                            $ErrorMsg = $_.Exception.Message
+                            Write-Information "Identifier URI update attempt $Attempt failed: $ErrorMsg"
+
+                            $IsNotReplicatedYet = $ErrorMsg -match "Resource '.*' does not exist or one of its queried reference-property objects are not present"
+                            $IsConflict = $ErrorMsg -match "Another object with the same value for property identifierUris already exists" -or $ErrorMsg -match "Property identifierUris is invalid"
+
+                            if ($IsConflict) {
+                                Write-Warning "Identifier URI conflict detected: $ErrorMsg"
+                                Write-Information "This may indicate the URI is already in use by another application or the app registration needs manual cleanup."
+                                throw
                             }
-                            continue
+
+                            if ($IsNotReplicatedYet -and $Attempt -lt 6) {
+                                $DelaySeconds = 3
+                                Write-Information "Application object not yet replicated for identifier URI update (attempt $Attempt of 6). Retrying in $DelaySeconds second(s)."
+                                Start-Sleep -Seconds $DelaySeconds
+                                try {
+                                    $APIApp = New-GraphGetRequest -uri "https://graph.microsoft.com/v1.0/applications(appid='$($APIApp.appId)')" -NoAuthCheck $true -AsApp $true
+                                    Write-Information "Re-fetched app: identifierUris=$($APIApp.identifierUris -join ', ')"
+                                } catch {
+                                    Write-Information "Application lookup retry failed before identifier URI retry: $($_.Exception.Message)"
+                                }
+                                continue
+                            }
+
+                            if ($Attempt -ge 6) {
+                                Write-Warning "Failed to set identifier URI after $Attempt attempts. Last error: $ErrorMsg"
+                            }
+                            throw
                         }
-                        throw
                     }
                 }
 
@@ -167,7 +220,7 @@ function New-CIPPAPIConfig {
                         } catch {
                             if ($Attempt -lt 6) {
                                 Start-Sleep -Seconds 3
-                                 Write-Information "Retrying service principal creation for AppId $($APIApp.appId) (attempt $Attempt of 6) after failure: $($_.Exception.Message)"
+                                Write-Information "Retrying service principal creation for AppId $($APIApp.appId) (attempt $Attempt of 6) after failure: $($_.Exception.Message)"
                                 continue
                             }
                             throw
@@ -182,36 +235,71 @@ function New-CIPPAPIConfig {
         if ($ResetSecret.IsPresent -and $APIApp) {
             if ($PSCmdlet.ShouldProcess($APIApp.displayName, 'Reset API Secret')) {
                 $Step = 'Resetting Application Password'
+
+                try {
+                    $PolicyUpdate = Update-AppManagementPolicy -ApplicationId $APIApp.appId
+                    Write-Information "Policy check for secret reset: $($PolicyUpdate.PolicyAction)"
+                } catch {
+                    Write-Information "Failed to update app management policy during secret reset: $($_.Exception.Message)"
+                }
+
+                $AppManagementPolicy = New-GraphGetRequest -uri 'https://graph.microsoft.com/v1.0/policies/defaultAppManagementPolicy' -AsApp $true -NoAuthCheck $true
+                $PasswordExpirationPolicy = $AppManagementPolicy.applicationRestrictions.passwordcredentials |
+                    Where-Object { $_.restrictionType -eq 'passwordLifetime' }
+
+                $NewPasswordCredential = @{
+                    displayName = 'Generated by API Setup'
+                }
+                if (-not ($PasswordExpirationPolicy.state -eq 'disabled' -or $null -eq $PasswordExpirationPolicy.state)) {
+                    $TimeToExpiration = [System.Xml.XmlConvert]::ToTimeSpan($PasswordExpirationPolicy.maxLifetime)
+                    $ExpirationDate = (Get-Date).AddDays($TimeToExpiration.Days).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ')
+                    $NewPasswordCredential.endDateTime = $ExpirationDate
+                }
+
                 Write-Information 'Removing all old passwords'
-                $Requests = @(
-                    @{
-                        id      = 'removeOldPasswords'
-                        method  = 'PATCH'
-                        url     = "applications/$($APIApp.id)/"
-                        headers = @{
-                            'Content-Type' = 'application/json'
-                        }
-                        body    = @{
-                            passwordCredentials = @()
-                        }
-                    },
-                    @{
-                        id        = 'addNewPassword'
-                        method    = 'POST'
-                        url       = "applications/$($APIApp.id)/addPassword"
-                        headers   = @{
-                            'Content-Type' = 'application/json'
-                        }
-                        body      = @{
-                            passwordCredential = @{
-                                displayName = 'Generated by API Setup'
+                for ($Attempt = 1; $Attempt -le 6; $Attempt++) {
+                    $Requests = @(
+                        @{
+                            id      = 'removeOldPasswords'
+                            method  = 'PATCH'
+                            url     = "applications/$($APIApp.id)/"
+                            headers = @{
+                                'Content-Type' = 'application/json'
                             }
+                            body    = @{
+                                passwordCredentials = @()
+                            }
+                        },
+                        @{
+                            id        = 'addNewPassword'
+                            method    = 'POST'
+                            url       = "applications/$($APIApp.id)/addPassword"
+                            headers   = @{
+                                'Content-Type' = 'application/json'
+                            }
+                            body      = @{
+                                passwordCredential = $NewPasswordCredential
+                            }
+                            dependsOn = @('removeOldPasswords')
                         }
-                        dependsOn = @('removeOldPasswords')
+                    )
+                    $BatchResponse = New-GraphBulkRequest -tenantid $env:TenantID -NoAuthCheck $true -asapp $true -Requests $Requests
+                    $AddPasswordResponse = $BatchResponse | Where-Object { $_.id -eq 'addNewPassword' }
+                    if ($AddPasswordResponse.status -ge 400) {
+                        $ErrorBody = $AddPasswordResponse.body
+                        $ErrorMsg = $ErrorBody.error.message ?? ($ErrorBody | ConvertTo-Json -Compress -Depth 5)
+                        $IsCredentialPolicyBlocked = $ErrorMsg -match 'Credential type not allowed as per assigned policy'
+                        if ($IsCredentialPolicyBlocked -and $Attempt -lt 6) {
+                            $DelaySeconds = [Math]::Min(10, 1 * $Attempt)
+                            Write-Information "Credential policy still blocks addPassword (attempt $Attempt of 6). Waiting for policy propagation and retrying in $DelaySeconds second(s)."
+                            Start-Sleep -Seconds $DelaySeconds
+                            continue
+                        }
+                        throw "Failed to add new password during secret reset: $ErrorMsg"
                     }
-                )
-                $BatchResponse = New-GraphBulkRequest -tenantid $env:TenantID -NoAuthCheck $true -asapp $true -Requests $Requests
-                $APIPassword = $BatchResponse | Where-Object { $_.id -eq 'addNewPassword' } | Select-Object -ExpandProperty body
+                    $APIPassword = $AddPasswordResponse.body
+                    break
+                }
                 Write-LogMessage -headers $Headers -API $APINAME -tenant 'None '-message "Reset CIPP-API Password for '$($APIApp.displayName)'." -Sev 'info'
             }
         }
