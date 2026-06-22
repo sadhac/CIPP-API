@@ -19,6 +19,21 @@ function Invoke-CippWebhookProcessing {
         return
     }
 
+    # Immediately claim this event ID to prevent concurrent workers from processing the same event.
+    # Uses Insert (no -Force) so a 409 conflict means another worker already claimed it.
+    # -ErrorAction Stop ensures non-terminating errors enter the catch block.
+    try {
+        Add-CIPPAzDataTableEntity @AuditLogTable -Entity @{
+            PartitionKey = $TenantFilter
+            RowKey       = $Data.Id
+            Title        = 'Processing'
+            Tenant       = $TenantFilter
+        } -ErrorAction Stop
+    } catch {
+        Write-Host "Audit log $($Data.Id) already claimed by another worker. Skipping."
+        return
+    }
+
     $Tenant = Get-Tenants -IncludeErrors | Where-Object { $_.defaultDomainName -eq $TenantFilter }
     Write-Host "Received data. Our Action List is $($Data.CIPPAction)"
 
@@ -64,7 +79,7 @@ function Invoke-CippWebhookProcessing {
                 "Completed BEC Remediate for $Username"
                 Write-LogMessage -API 'BECRemediate' -tenant $tenantfilter -message "Executed Remediation for $Username" -sev 'Info'
             }
-            'cippcommand' {
+            <#'cippcommand' {
                 $CommandSplat = @{}
                 $action.parameters.psobject.properties | ForEach-Object { $CommandSplat.Add($_.name, $_.value) }
                 if ($CommandSplat['userid']) { $CommandSplat['userid'] = $Data.UserId }
@@ -73,23 +88,17 @@ function Invoke-CippWebhookProcessing {
                 if ($CommandSplat['user']) { $CommandSplat['user'] = $Data.UserId }
                 if ($CommandSplat['username']) { $CommandSplat['username'] = $Data.UserId }
                 & $action.command.value @CommandSplat
+            }#>
+            default {
+                Write-Host "Unknown action: $action"
             }
-        }
-    }
-
-    $CustomSubject = $null
-    if ($Data.CIPPRuleId) {
-        $WebhookRulesTable = Get-CIPPTable -TableName 'WebhookRules'
-        $WebhookRule = Get-CIPPAzDataTableEntity @WebhookRulesTable -Filter "PartitionKey eq 'WebhookRule' and RowKey eq '$($Data.CIPPRuleId)'"
-        if (![string]::IsNullOrEmpty($WebhookRule.CustomSubject)) {
-            $CustomSubject = $WebhookRule.CustomSubject
         }
     }
 
     # Save audit log entry to table
     $LocationInfo = $Data.CIPPLocationInfo | ConvertFrom-Json -ErrorAction SilentlyContinue
     $AuditRecord = $Data.AuditRecord | ConvertFrom-Json -ErrorAction SilentlyContinue
-    $GenerateJSON = New-CIPPAlertTemplate -format 'json' -data $Data -ActionResults $ActionResults -CIPPURL $CIPPURL -AlertComment $WebhookRule.AlertComment -CustomSubject $CustomSubject -Tenant $Tenant.defaultDomainName
+    $GenerateJSON = New-CIPPAlertTemplate -format 'json' -data $Data -ActionResults $ActionResults -CIPPURL $CIPPURL -AlertComment $AlertComment -CustomSubject $Data.CIPPCustomSubject -Tenant $Tenant.defaultDomainName
     $JsonContent = @{
         Title                 = $GenerateJSON.Title
         ActionUrl             = $GenerateJSON.ButtonUrl
@@ -102,18 +111,18 @@ function Invoke-CippWebhookProcessing {
         AlertComment          = $AlertComment
     } | ConvertTo-Json -Depth 15 -Compress
 
-    $CIPPAlert = @{
-        Type         = 'table'
-        Title        = $GenerateJSON.Title
-        JSONContent  = $JsonContent
-        TenantFilter = $TenantFilter
-        TableName    = 'AuditLogs'
+    # Update the sentinel row claimed earlier with full audit log data
+    Add-CIPPAzDataTableEntity @AuditLogTable -Entity @{
+        PartitionKey = $TenantFilter
         RowKey       = $Data.Id
-    }
-    $LogId = Send-CIPPAlert @CIPPAlert
+        Title        = $GenerateJSON.Title
+        Data         = [string]$JsonContent
+        Tenant       = $TenantFilter
+    } -Force
+    $LogId = $Data.Id
 
     $AuditLogLink = '{0}/tenant/administration/audit-logs/log?logId={1}&tenantFilter={2}' -f $CIPPURL, $LogId, $Tenant.defaultDomainName
-    $GenerateEmail = New-CIPPAlertTemplate -format 'html' -data $Data -ActionResults $ActionResults -CIPPURL $CIPPURL -Tenant $Tenant.defaultDomainName -AuditLogLink $AuditLogLink -AlertComment $AlertComment
+    $GenerateEmail = New-CIPPAlertTemplate -format 'html' -data $Data -ActionResults $ActionResults -CIPPURL $CIPPURL -Tenant $Tenant.defaultDomainName -AuditLogLink $AuditLogLink -AlertComment $AlertComment -CustomSubject $Data.CIPPCustomSubject
 
     Write-Host 'Going to create the content'
     foreach ($action in $ActionList ) {
@@ -140,12 +149,12 @@ function Invoke-CippWebhookProcessing {
             }
             'generateWebhook' {
                 $CippAlert = @{
-                    Type         = 'webhook'
-                    Title        = $GenerateJSON.Title
-                    JSONContent  = $JsonContent
-                    TenantFilter = $TenantFilter
-                    APIName      = 'Audit Log Alerts'
-                    SchemaSource = 'Audit Log Alert'
+                    Type            = 'webhook'
+                    Title           = $GenerateJSON.Title
+                    JSONContent     = $JsonContent
+                    TenantFilter    = $TenantFilter
+                    APIName         = 'Audit Log Alerts'
+                    SchemaSource    = 'Audit Log Alert'
                     InvokingCommand = 'Start-AuditLogProcessingOrchestrator'
                 }
                 Write-Host 'Sending Webhook Content'
